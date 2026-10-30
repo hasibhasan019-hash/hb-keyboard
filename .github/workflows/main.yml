@@ -1,0 +1,180 @@
+name: Build HB Keyboard
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download original source
+        run: git clone --depth 1 https://github.com/fahitakrim/Orbit-Board.git src
+
+      - name: Apply privacy changes
+        working-directory: src
+        run: |
+          python3 - <<'PY'
+          import re, os, shutil, sys
+
+          def rd(p): return open(p, encoding='utf-8').read()
+          def wr(p, s): open(p, 'w', encoding='utf-8').write(s)
+          def must(cond, msg):
+              if not cond:
+                  print('PATCH FAILED:', msg); sys.exit(1)
+
+          J = 'java/'
+          shutil.rmtree(J + 'src/org/futo/inputmethod/latin/capture', ignore_errors=True)
+          t = J + 'src/org/futo/inputmethod/keyboard/internal/Translator.kt'
+          if os.path.exists(t):
+              wr(t, 'package org.futo.inputmethod.keyboard.internal\n\nobject CloudTranslationHandler {\n    suspend fun translate(source: String, target: String, text: String): Result<String> = Result.failure(Exception("Online translation is disabled"))\n    class TranslationException(message: String, cause: Throwable? = null) : Exception(message, cause)\n}\n')
+
+          p = J + 'AndroidManifest.xml'; s = rd(p)
+          s = re.sub(r'[ \t]*<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"\s*/>\n', '', s)
+          s = re.sub(r'[ \t]*<uses-permission android:name="android.permission.INTERNET"\s*/>\n', '', s)
+          s = re.sub(r'[ \t]*<activity android:name="\.capture\.CapturePermissionActivity".*?</activity>\n\n?', '', s, flags=re.S)
+          s = re.sub(r'[ \t]*<service android:name="\.capture\.CaptureService"[^>]*/>\n\n?', '', s)
+          must('INTERNET' not in s and 'MEDIA_PROJECTION' not in s and 'capture.' not in s, 'manifest')
+          wr(p, s)
+
+          p = J + 'src/org/futo/inputmethod/updates/UpdateChecker.kt'; s = rd(p)
+          s = re.sub(r'const val RAW_UPDATE_URL = ".*?"', 'const val RAW_UPDATE_URL = ""', s)
+          s = re.sub(r'const val GITHUB_API_URL = ".*?"', 'const val GITHUB_API_URL = ""', s)
+          s = s.replace('"https://github.com/fahitakrim/my-artifacts/releases"', '""')
+          a = 'Dispatchers.IO) {\n        _isChecking.value = true'
+          must(a in s, 'UpdateChecker')
+          s = s.replace(a, 'Dispatchers.IO) {\n        if (true) return@withContext Result.failure<AppUpdate>(Exception("disabled"))\n        _isChecking.value = true', 1)
+          wr(p, s)
+
+          p = J + 'src/org/futo/inputmethod/announcements/AnnouncementManager.kt'; s = rd(p)
+          s = re.sub(r'"https://raw\.githubusercontent\.com/[^"]*"', '""', s)
+          a = 'withContext(Dispatchers.IO) {\n        fetchFromUrl(endpointUrl)\n    }'
+          must(a in s, 'AnnouncementManager')
+          s = s.replace(a, 'withContext(Dispatchers.IO) {\n        null\n    }', 1)
+          wr(p, s)
+
+          p = J + 'src/org/futo/inputmethod/latin/LatinIME.kt'
+          L = rd(p).split('\n')
+          def find(pred, start=0):
+              for i in range(start, len(L)):
+                  if pred(L[i]): return i
+              must(False, 'LatinIME marker not found')
+          def brace_end(i):
+              d = 0; seen = False
+              for j in range(i, len(L)):
+                  line = re.sub(r'"(\\.|[^"\\])*"', '""', L[j])
+                  d += line.count('{') - line.count('}')
+                  if '{' in line: seen = True
+                  if seen and d == 0: return j
+              must(False, 'brace')
+          i = find(lambda l: 'private fun processScreenshot' in l); del L[i:brace_end(i)+1]
+          i = find(lambda l: 'private fun showCaptureRequestNotification' in l); del L[i:brace_end(i)+1]
+          i = find(lambda l: 'fun startAiAssist()' in l); e = brace_end(i)
+          d0 = i-1 if 'Called by keyboard' in L[i-1] else i
+          L[d0:e+1] = ['    fun startAiAssist() { }']
+          i = find(lambda l: 'private val screenshotReceiver' in l); del L[i:brace_end(i)+1]
+          i = find(lambda l: 'Register receiver for screenshots' in l)
+          j = find(lambda l: 'RECEIVER_NOT_EXPORTED' in l and 'screenshotReceiver' in l, i); del L[i:j+1]
+          i = find(lambda l: 'unregisterReceiver(screenshotReceiver)' in l); del L[i]
+          s = '\n'.join(L)
+          must('ndpnt' not in s and 'screenshotReceiver' not in s and 'processScreenshot' not in s, 'LatinIME leftovers')
+          b = re.sub(r'"(\\.|[^"\\])*"', '""', s)
+          must(b.count('{') == b.count('}'), 'LatinIME braces unbalanced')
+          wr(p, s)
+
+          p = J + 'src/org/futo/inputmethod/latin/uix/settings/pages/Home.kt'; s = rd(p)
+          s = re.sub(r'[ \t]*DeveloperDetailsCard\(modifier = Modifier\.padding\(horizontal = 16\.dp\)\)\n', '', s)
+          s = s.replace('title = "About Developer"', 'title = "Customized by Hasib B. Hasan"')
+          must('DeveloperDetailsCard(' not in s and 'Customized by Hasib' in s, 'Home')
+          wr(p, s)
+
+          p = J + 'src/org/futo/inputmethod/latin/uix/settings/pages/Credits.kt'; s = rd(p)
+          s = re.sub(r'ScreenTitle\("Developer"\)\n([ \t]*)ParagraphText\("Lead Developer[^\n]*\n',
+                     lambda m: 'ScreenTitle("About this build")\n' + m.group(1) + 'ParagraphText("Customized by Hasib B. Hasan (privacy build).\\nBased on the open-source Orbit Board and FUTO Keyboard projects.")\n', s)
+          s = s.replace(', developed and maintained by Fahim Takrim.', '.')
+          must('itz.takrim' not in s and 'Fahim' not in s and 'Hasib B. Hasan' in s, 'Credits')
+          wr(p, s)
+
+          p = J + 'src/org/futo/inputmethod/latin/uix/settings/pages/Help.kt'; s = rd(p)
+          k = s.find('title = "Report a Bug / Feedback"')
+          must(k != -1, 'Help marker')
+          st = s.rfind('NavigationItem(', 0, k)
+          t = re.sub(r'"(\\.|[^"\\])*"', lambda m: '"' + ' ' * (len(m.group(0)) - 2) + '"', s)
+          d = 0; seen = False; en = -1
+          for idx in range(st, len(t)):
+              if t[idx] == '(':
+                  d += 1; seen = True
+              elif t[idx] == ')':
+                  d -= 1
+                  if seen and d == 0:
+                      en = idx; break
+          must(en != -1, 'Help paren')
+          ls = s.rfind('\n', 0, st) + 1
+          s = s[:ls].rstrip(' \t') + s[en + 1:].lstrip(' \t').lstrip('\n')
+          must('itz.takrim' not in s, 'Help')
+          wr(p, s)
+
+          for p in [J + 'res/values/strings-appname.xml', J + 'res/values-bn/strings.xml', J + 'res/values/strings-crash-reporting.xml']:
+              s = rd(p)
+              s = re.sub(r'(<string name="(?:english_ime_name|english_ime_settings|crashed_text_email|crashed_text)">)([^<]*)(</string>)',
+                         lambda m: m.group(1) + m.group(2).replace('Orbit Board', 'HB Keyboard') + m.group(3), s)
+              wr(p, s)
+
+          p = J + 'src/org/futo/inputmethod/latin/uix/settings/pages/Home.kt'; s = rd(p)
+          s = s.replace('Orbit Board is up to date', 'HB Keyboard is up to date')
+          wr(p, s)
+
+          p = J + 'src/org/futo/inputmethod/latin/uix/settings/pages/Credits.kt'; s = rd(p)
+          s = s.replace('ScreenTitle("Orbit Board"', 'ScreenTitle("HB Keyboard"').replace('Orbit Board is an aesthetic', 'HB Keyboard is an aesthetic')
+          wr(p, s)
+
+          print('All privacy changes applied OK')
+          PY
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK parts
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0" "ndk;25.1.8937393"
+
+      - name: Create signing key
+        working-directory: src
+        run: |
+          keytool -genkeypair -keystore release.keystore -alias orbit -keyalg RSA -keysize 2048 -validity 10000 -storepass orbitpass123 -keypass orbitpass123 -dname "CN=HB Keyboard Personal"
+          printf 'keyAlias=orbit\nkeyPassword=orbitpass123\nstoreFile=release.keystore\nstorePassword=orbitpass123\n' > keystore.properties
+
+      - name: Build APK
+        working-directory: src
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleStableRelease --no-daemon --stacktrace
+
+      - name: Privacy check
+        run: |
+          find src -name "*.apk" -path "*outputs*" | tee apks.txt
+          AAPT2=$ANDROID_HOME/build-tools/34.0.0/aapt2
+          FAIL=0
+          while read APK; do
+            "$AAPT2" dump permissions "$APK" | tee perms.txt
+            if grep -q -E "INTERNET|MEDIA_PROJECTION" perms.txt; then echo "FAIL: bad permission"; FAIL=1; fi
+            HITS=$(unzip -p "$APK" 'classes*.dex' | strings | grep -c -E "ndpnt|translate.googleapis|my-artifacts|CaptureService" || true)
+            echo "suspicious strings: $HITS"
+            if [ "$HITS" != "0" ]; then FAIL=1; fi
+          done < apks.txt
+          exit $FAIL
+
+      - name: Publish APK as release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" $(cat apks.txt) --title "HB Keyboard ${{ github.run_number }}" --notes "No INTERNET, no screen capture."
